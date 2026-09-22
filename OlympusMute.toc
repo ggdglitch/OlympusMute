@@ -1,8 +1,8 @@
 ## Interface: 11507
 ## Title: OlympusMute
-## Notes: Filters chat from players in selected guilds, with persistent guild filters and automatic background scanning.
+## Notes: Filters chat from players in selected guilds with persistent guild keywords and manual /who scanning.
 ## Author: Sol
-## Version: 1.1.1
+## Version: 1.2.0
 ## SavedVariables: OlympusMuteDB
 
 OlympusMute.lua
