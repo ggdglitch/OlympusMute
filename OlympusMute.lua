@@ -1,13 +1,12 @@
--- OlympusMute: hides chat from players whose guild name contains "Olympus".
+-- OlympusMute: hides chat from players whose guild name contains any saved keyword.
 -- Purely client-side. Nothing is added to the ignore list; senders aren't notified.
 --
 -- Chat events don't carry the sender's guild, so the addon learns guilds by
 -- watching players it can see (target, mouseover, nameplates, group) and from
 -- any /who results you run. Learned players are kept only for the current session.
 
--- Guild-name fragments to match (case-insensitive).
--- Matches names such as "Olympus", "Olympus Canada", "Olympus-Canada", etc.
-local DEFAULT_MATCHES = { "olympus", "olympus canada" }
+local DEFAULT_KEYWORDS = { "olympus" }   -- case-insensitive parts of guild names
+local MIN_KEYWORD_LEN = 3                 -- avoids accidental 1-2 letter matches
 local PREFIX = "|cff66ccffOlympusMute:|r "
 
 local db
@@ -37,11 +36,12 @@ local function IsSecret(v)
     return issecretvalue and issecretvalue(v)
 end
 
+-- True if the guild name contains any configured keyword.
 local function IsOlympus(guild)
-    if type(guild) ~= "string" then return false end
-    local lower = guild:lower()
-    for _, match in ipairs((db and db.guildMatches) or DEFAULT_MATCHES) do
-        if lower:find(match, 1, true) ~= nil then return true end
+    if type(guild) ~= "string" or guild == "" or not db then return false end
+    local g = guild:lower()
+    for _, kw in ipairs(db.keywords or {}) do
+        if g:find(kw, 1, true) then return true end
     end
     return false
 end
@@ -81,6 +81,17 @@ local function DeclinePartyInvite(name, guild)
     Print(("declined a group invite from %s <%s>."):format(tostring(name), tostring(guild)))
 end
 
+-- Highest level seen on a matching guild member. The /who scan rotation
+-- can then avoid searching above the highest level we've actually observed.
+local function NoteLevel(level)
+    level = tonumber(level)
+    if not level or level < 1 or level > 200 then return end
+    if level > (db.maxSeenLevel or 0) then
+        db.maxSeenLevel = level
+        scanQueries = nil
+    end
+end
+
 local function Block(guid, name, guild)
     local key = Normalize(name)
     if not key then return end
@@ -109,6 +120,17 @@ local function Unblock(guid, name, force)
     end
 end
 
+local function UnblockFormer(name, newGuild)
+    local key = Normalize(name)
+    if not key or not db.names[key] or db.manual[key] then return end
+    Unblock(nil, name, true)
+    if db.debug then
+        Print(("debug: unmuted %s, now %s"):format(
+            name, (newGuild and newGuild ~= "") and ("<" .. newGuild .. ">") or "unguilded"))
+    end
+    if panel and panel:IsShown() then panel:Refresh() end
+end
+
 ---------------------------------------------------------------------------
 -- Learning guilds
 ---------------------------------------------------------------------------
@@ -122,6 +144,7 @@ local function ScanUnit(unit)
 
     local guild = GetGuildInfo(unit)
     if IsOlympus(guild) then
+        NoteLevel(UnitLevel(unit))
         Block(guid, name, guild)
     elseif guild then
         Unblock(guid, name)      -- they're now in a different guild
@@ -145,7 +168,10 @@ local function ScanWho()
     for i = 1, C_FriendList.GetNumWhoResults() do
         local info = C_FriendList.GetWhoInfo(i)
         if info and IsOlympus(info.fullGuildName) then
+            NoteLevel(info.level)
             Block(nil, info.fullName, info.fullGuildName)
+        elseif info and info.fullName then
+            UnblockFormer(info.fullName, info.fullGuildName)
         end
     end
 end
@@ -165,7 +191,12 @@ local function ParseWhoLine(msg)
     local name, rest = msg:match("^|Hplayer:([^:|]+)|h%[[^%]]*%]|h: (.*)$")
     if not name then return end
     local guild = rest:match("<([^<>]+)>")
-    if IsOlympus(guild) then Block(nil, name, guild) end
+    if IsOlympus(guild) then
+        NoteLevel(rest:match("(%d+)"))
+        Block(nil, name, guild)
+    else
+        UnblockFormer(name, guild)
+    end
 end
 
 local function HookChatFrames()
@@ -328,12 +359,31 @@ f:SetScript("OnEvent", function(self, event, arg1, ...)
         db.guids = db.guids or {}
         db.names = db.names or {}
         db.manual = db.manual or {}
-        if db.guildMatches == nil then
-            db.guildMatches = {}
-            for _, match in ipairs(DEFAULT_MATCHES) do
-                db.guildMatches[#db.guildMatches + 1] = match
-            end
+
+        -- v1.2 uses "keywords" instead of the older "guildMatches" name.
+        -- Merge both tables during upgrade so existing custom filters are kept.
+        local migratedKeywords = {}
+        local seenKeywords = {}
+        local function addKeywordValue(value)
+            if type(value) ~= "string" then return end
+            value = strtrim(value):lower():gsub('"', "")
+            if #value < MIN_KEYWORD_LEN or seenKeywords[value] then return end
+            seenKeywords[value] = true
+            migratedKeywords[#migratedKeywords + 1] = value
         end
+
+        if type(db.keywords) == "table" then
+            for _, kw in ipairs(db.keywords) do addKeywordValue(kw) end
+        end
+        if type(db.guildMatches) == "table" then
+            for _, kw in ipairs(db.guildMatches) do addKeywordValue(kw) end
+        end
+        if #migratedKeywords == 0 then
+            for _, kw in ipairs(DEFAULT_KEYWORDS) do addKeywordValue(kw) end
+        end
+        db.keywords = migratedKeywords
+        db.guildMatches = nil
+        db.maxSeenLevel = tonumber(db.maxSeenLevel) or 0
         if db.enabled == nil then db.enabled = true end
         -- 1.0.5 split the single invite setting into guild and group
         local old = db.declineInvites
@@ -413,14 +463,14 @@ local function OnOff(v) return v and "|cff00ff00ON|r" or "|cffff0000OFF|r" end
 
 local function SetDeclineGuild(on)
     db.declineGuild = on and true or false
-    Print("auto-decline Olympus guild invites " .. OnOff(db.declineGuild))
+    Print("auto-decline invites from muted guilds " .. OnOff(db.declineGuild))
     if panel and panel:IsShown() then panel:Refresh() end
 end
 
 local function SetDeclineGroup(on)
     db.declineGroup = on and true or false
     if not db.declineGroup then pendingInvite = nil end
-    Print("auto-decline group invites from Olympus members " .. OnOff(db.declineGroup))
+    Print("auto-decline group invites from muted players " .. OnOff(db.declineGroup))
     if panel and panel:IsShown() then panel:Refresh() end
 end
 
@@ -459,14 +509,18 @@ local function ClearAll()
 end
 
 -- /who only returns the first 50 matches, so one search can't cover every
--- matching guild. Each user-initiated scan runs the next search in a rotation
--- of level ranges, reaching members the plain search cuts off. WoW requires
--- SendWho() to originate from a hardware event, so this cannot run on a timer.
+-- matching guild. Each user-initiated scan runs the next search in a rotation.
+-- We include a broad guild search plus level ranges up to the highest matching
+-- member level we've seen, rather than always scanning the full level cap.
 local function BuildScanQueries()
-    local maxLevel = (GetMaxPlayerLevel and GetMaxPlayerLevel()) or 60
+    local cap = (GetMaxPlayerLevel and GetMaxPlayerLevel()) or 60
+    local playerLevel = tonumber(UnitLevel("player")) or 1
+    local maxLevel = math.min(cap, math.max(db.maxSeenLevel or 0, playerLevel))
     local q = {}
-    for _, match in ipairs((db and db.guildMatches) or DEFAULT_MATCHES) do
-        local base = 'g-"' .. match .. '"'
+
+    for _, kw in ipairs(db.keywords or {}) do
+        local base = 'g-"' .. kw .. '"'
+        q[#q + 1] = base
         local lo = 1
         while lo <= maxLevel - 4 do
             q[#q + 1] = ("%s %d-%d"):format(base, lo, lo + 3)
@@ -479,8 +533,12 @@ local function BuildScanQueries()
     return q
 end
 
-WhoScan = function(silent)
+WhoScan = function()
     scanQueries = scanQueries or BuildScanQueries()
+    if #scanQueries == 0 then
+        Print("the guild list is empty, nothing to scan.")
+        return
+    end
     scanStep = scanStep % #scanQueries + 1
     local query = scanQueries[scanStep]
     if C_FriendList and C_FriendList.SendWho then
@@ -488,11 +546,7 @@ WhoScan = function(silent)
     elseif SendWho then
         SendWho(query)
     end
-    if not silent then
-        Print(("scan %d/%d: /who %s"):format(scanStep, #scanQueries, query))
-    elseif db and db.debug then
-        Print(("scan %d/%d: /who %s"):format(scanStep, #scanQueries, query))
-    end
+    Print(("scan %d/%d: /who %s"):format(scanStep, #scanQueries, query))
     if panel and panel.UpdateScanButton then panel:UpdateScanButton() end
 end
 
@@ -522,54 +576,74 @@ StaticPopupDialogs["OLYMPUSMUTE_CLEAR"] = {
 }
 
 ---------------------------------------------------------------------------
--- Saved guild-name filters
+-- Saved guild-name keywords
 ---------------------------------------------------------------------------
-local function NormalizeGuildMatch(value)
+local function KeywordList()
+    return #(db.keywords or {}) > 0 and table.concat(db.keywords, ", ") or "(none)"
+end
+
+local function NormalizeKeyword(value)
     if type(value) ~= "string" then return nil end
-    value = strtrim(value):lower()
-    if value == "" then return nil end
+    value = strtrim(value):lower():gsub('"', "")
+    if #value < MIN_KEYWORD_LEN then return nil end
     return value
 end
 
-local function AddGuildMatch(value)
-    local match = NormalizeGuildMatch(value)
-    if not match then return false, "enter a guild name or fragment" end
-    db.guildMatches = db.guildMatches or {}
-    for _, existing in ipairs(db.guildMatches) do
-        if existing == match then return false, "that guild filter is already saved" end
+local function AddKeyword(text)
+    local kw = NormalizeKeyword(text)
+    if not kw then
+        Print(("guild names need at least %d letters."):format(MIN_KEYWORD_LEN))
+        return false
     end
-    db.guildMatches[#db.guildMatches + 1] = match
+    for _, k in ipairs(db.keywords) do
+        if k == kw then
+            Print('"' .. kw .. '" is already on the guild list.')
+            return false
+        end
+    end
+    db.keywords[#db.keywords + 1] = kw
     scanQueries = nil
-    Print("saved guild filter: " .. match)
-    if panel and panel:IsShown() and panel.Refresh then panel:Refresh() end
+    Print(('now muting guilds containing "%s". Guild list: %s'):format(kw, KeywordList()))
+    if panel and panel:IsShown() then panel:Refresh() end
     return true
 end
 
-local function RemoveGuildMatch(value)
-    local match = NormalizeGuildMatch(value)
-    if not match then return false end
-    for i = #db.guildMatches, 1, -1 do
-        if db.guildMatches[i] == match then
-            table.remove(db.guildMatches, i)
+local function RemoveKeyword(text)
+    local kw = NormalizeKeyword(text)
+    if not kw then
+        Print(("guild names need at least %d letters."):format(MIN_KEYWORD_LEN))
+        return false
+    end
+
+    for i, k in ipairs(db.keywords) do
+        if k == kw then
+            table.remove(db.keywords, i)
             scanQueries = nil
-            Print("removed guild filter: " .. match)
-            if panel and panel:IsShown() and panel.Refresh then panel:Refresh() end
+
+            -- Remove learned players who no longer match any remaining keyword.
+            -- Manually added players are preserved.
+            local toUnblock = {}
+            for name, guild in pairs(db.names) do
+                if not db.manual[name] and not IsOlympus(guild) then
+                    toUnblock[#toUnblock + 1] = name
+                end
+            end
+            for _, name in ipairs(toUnblock) do
+                Unblock(nil, name, true)
+            end
+
+            Print(('removed "%s" (%d players unmuted). Guild list: %s'):format(kw, #toUnblock, KeywordList()))
+            if panel and panel:IsShown() then panel:Refresh() end
             return true
         end
     end
-    Print("guild filter not found: " .. match)
+
+    Print('"' .. kw .. '" isn\'t on the guild list. Current list: ' .. KeywordList())
     return false
 end
 
-local function ListGuildMatches()
-    if not db.guildMatches or #db.guildMatches == 0 then
-        Print("no guild-name filters saved.")
-        return
-    end
-    Print("saved guild-name filters:")
-    for i, match in ipairs(db.guildMatches) do
-        Print(("%d. %s"):format(i, match))
-    end
+local function ListKeywords()
+    Print("guild keywords: " .. KeywordList())
 end
 
 ---------------------------------------------------------------------------
@@ -587,12 +661,11 @@ CreatePanel = function()
     desc:SetPoint("TOPLEFT", title, "BOTTOMLEFT", 0, -8)
     desc:SetPoint("RIGHT", panel, "RIGHT", -16, 0)
     desc:SetJustifyH("LEFT")
-    desc:SetText("Hides chat from players whose guild name matches one of your saved guild-name filters. "
-        .. "Only affects your screen and doesn't use your ignore list. Players are learned "
+    desc:SetText("Hides chat from players whose guild name contains any keyword on your guild list "
+        .. "(Olympus by default). Only affects your screen and doesn't use your ignore list. Players are learned "
         .. "when you target, mouse over, group with, or see their nameplate, from /who results, "
         .. "or when you shift-click their name in chat.")
 
-    -- Enable checkbox
     local enable = CreateFrame("CheckButton", nil, panel, "UICheckButtonTemplate")
     enable:SetPoint("TOPLEFT", desc, "BOTTOMLEFT", -2, -12)
     local enableLabel = enable.Text or enable.text or enable:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
@@ -611,10 +684,10 @@ CreatePanel = function()
         c:SetScript("OnClick", function(self) onClick(self:GetChecked()) end)
         return c
     end
-    local declineGuild = MakeCheck("Auto-decline guild invites from Olympus guilds", enable, SetDeclineGuild)
-    local declineGroup = MakeCheck("Auto-decline group invites from Olympus members", declineGuild, SetDeclineGroup)
 
-    -- Buttons row
+    local declineGuild = MakeCheck("Auto-decline guild invites from muted guilds", enable, SetDeclineGuild)
+    local declineGroup = MakeCheck("Auto-decline group invites from muted players", declineGuild, SetDeclineGroup)
+
     local function MakeButton(text, width, onClick, anchor, x, y)
         local b = CreateFrame("Button", nil, panel, "UIPanelButtonTemplate")
         b:SetSize(width, 24)
@@ -624,57 +697,50 @@ CreatePanel = function()
         return b
     end
 
-    local whoBtn = MakeButton("Scan /who guilds", 200, WhoScan, declineGroup, nil, -10)
+    -- Guild keyword list.
+    local kwLabel = panel:CreateFontString(nil, "ARTWORK", "GameFontNormal")
+    kwLabel:SetPoint("TOPLEFT", declineGroup, "BOTTOMLEFT", 2, -10)
+    kwLabel:SetText("Muted guild names (matches any part of the name):")
+
+    local kwBox = CreateFrame("EditBox", nil, panel, "InputBoxTemplate")
+    kwBox:SetSize(180, 20)
+    kwBox:SetPoint("TOPLEFT", kwLabel, "BOTTOMLEFT", 6, -6)
+    kwBox:SetAutoFocus(false)
+
+    local function KwAction(fn)
+        return function()
+            fn(kwBox:GetText() or "")
+            kwBox:SetText("")
+            kwBox:ClearFocus()
+        end
+    end
+
+    kwBox:SetScript("OnEnterPressed", KwAction(AddKeyword))
+    kwBox:SetScript("OnEscapePressed", kwBox.ClearFocus)
+    local kwAdd = MakeButton("Add guild", 90, KwAction(AddKeyword), kwBox, 8, 2)
+    MakeButton("Remove guild", 110, KwAction(RemoveKeyword), kwAdd, 8, 0)
+
+    local kwText = panel:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+    kwText:SetPoint("TOPLEFT", kwBox, "BOTTOMLEFT", -6, -8)
+    kwText:SetPoint("RIGHT", panel, "RIGHT", -16, 0)
+    kwText:SetJustifyH("LEFT")
+
+    -- User-initiated /who scan. Blizzard protects SendWho(), so this must be
+    -- triggered by an actual button click or slash command.
+    local whoBtn = MakeButton("Scan /who", 200, WhoScan, kwText, nil, -10)
     function panel:UpdateScanButton()
         local total = (scanQueries and #scanQueries) or #BuildScanQueries()
-        whoBtn:SetText(("Scan /who guilds (%d/%d)"):format(scanStep % total + 1, total))
+        if total == 0 then
+            whoBtn:SetText("Scan /who (no guilds)")
+        else
+            whoBtn:SetText(("Scan /who (%d/%d)"):format(scanStep % total + 1, total))
+        end
     end
-    local clearBtn = MakeButton("Clear player list", 130, function() StaticPopup_Show("OLYMPUSMUTE_CLEAR") end, whoBtn, 8, 0)
+    MakeButton("Clear list", 110, function() StaticPopup_Show("OLYMPUSMUTE_CLEAR") end, whoBtn, 8, 0)
 
-    -- Saved guild-name filters
-    local guildLabel = panel:CreateFontString(nil, "ARTWORK", "GameFontNormal")
-    guildLabel:SetPoint("TOPLEFT", whoBtn, "BOTTOMLEFT", 0, -16)
-    guildLabel:SetText("Guild-name filters (saved automatically):")
-
-    local guildBox = CreateFrame("EditBox", nil, panel, "InputBoxTemplate")
-    guildBox:SetSize(210, 20)
-    guildBox:SetPoint("TOPLEFT", guildLabel, "BOTTOMLEFT", 6, -6)
-    guildBox:SetAutoFocus(false)
-
-    local function DoAddGuild()
-        local value = strtrim(guildBox:GetText() or "")
-        AddGuildMatch(value)
-        guildBox:SetText("")
-        guildBox:ClearFocus()
-    end
-
-    guildBox:SetScript("OnEnterPressed", DoAddGuild)
-    guildBox:SetScript("OnEscapePressed", guildBox.ClearFocus)
-    MakeButton("Add guild", 90, DoAddGuild, guildBox, 8, 2)
-
-    local guildList = panel:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
-    guildList:SetPoint("TOPLEFT", guildBox, "BOTTOMLEFT", 0, -8)
-    guildList:SetJustifyH("LEFT")
-    guildList:SetSpacing(2)
-
-    local guildRemoveBox = CreateFrame("EditBox", nil, panel, "InputBoxTemplate")
-    guildRemoveBox:SetSize(210, 20)
-    guildRemoveBox:SetPoint("TOPLEFT", guildList, "BOTTOMLEFT", 0, -8)
-    guildRemoveBox:SetAutoFocus(false)
-
-    local function DoRemoveGuild()
-        RemoveGuildMatch(guildRemoveBox:GetText() or "")
-        guildRemoveBox:SetText("")
-        guildRemoveBox:ClearFocus()
-    end
-
-    guildRemoveBox:SetScript("OnEnterPressed", DoRemoveGuild)
-    guildRemoveBox:SetScript("OnEscapePressed", guildRemoveBox.ClearFocus)
-    MakeButton("Remove guild", 90, DoRemoveGuild, guildRemoveBox, 8, 2)
-
-    -- Remove one player
+    -- Manually mute one player.
     local addLabel = panel:CreateFontString(nil, "ARTWORK", "GameFontNormal")
-    addLabel:SetPoint("TOPLEFT", guildRemoveBox, "BOTTOMLEFT", -6, -16)
+    addLabel:SetPoint("TOPLEFT", whoBtn, "BOTTOMLEFT", 0, -16)
     addLabel:SetText("Mute a player (Name or Name-Realm):")
 
     local addBox = CreateFrame("EditBox", nil, panel, "InputBoxTemplate")
@@ -683,7 +749,8 @@ CreatePanel = function()
     addBox:SetAutoFocus(false)
     local function DoAdd()
         AddPlayer(strtrim(addBox:GetText() or ""))
-        addBox:SetText(""); addBox:ClearFocus()
+        addBox:SetText("")
+        addBox:ClearFocus()
     end
     addBox:SetScript("OnEnterPressed", DoAdd)
     addBox:SetScript("OnEscapePressed", addBox.ClearFocus)
@@ -699,13 +766,13 @@ CreatePanel = function()
     box:SetAutoFocus(false)
     local function DoRemove()
         RemovePlayer(strtrim(box:GetText() or ""))
-        box:SetText(""); box:ClearFocus()
+        box:SetText("")
+        box:ClearFocus()
     end
     box:SetScript("OnEnterPressed", DoRemove)
     box:SetScript("OnEscapePressed", box.ClearFocus)
-    local removeBtn = MakeButton("Unmute", 90, DoRemove, box, 8, 2)
+    MakeButton("Unmute", 90, DoRemove, box, 8, 2)
 
-    -- Muted list
     local countText = panel:CreateFontString(nil, "ARTWORK", "GameFontNormal")
     countText:SetPoint("TOPLEFT", box, "BOTTOMLEFT", -6, -16)
 
@@ -722,15 +789,10 @@ CreatePanel = function()
 
     function panel:Refresh()
         enable:SetChecked(db.enabled)
+        kwText:SetText("Current list: |cffffffff" .. KeywordList() .. "|r")
         self:UpdateScanButton()
         declineGuild:SetChecked(db.declineGuild)
         declineGroup:SetChecked(db.declineGroup)
-
-        local filters = {}
-        for i, match in ipairs(db.guildMatches or {}) do
-            filters[#filters + 1] = ("%d. %s"):format(i, match)
-        end
-        guildList:SetText(#filters > 0 and table.concat(filters, "\n") or "|cff999999No guild filters saved.|r")
 
         local names = {}
         for name, guild in pairs(db.names) do
@@ -739,9 +801,11 @@ CreatePanel = function()
         table.sort(names)
         countText:SetText(("Muted players: %d"):format(#names))
         listText:SetWidth(math.max(scroll:GetWidth() - 10, 200))
-        listText:SetText(#names > 0 and table.concat(names, "\n") or "|cff999999None yet.|r")
+        listText:SetText(#names > 0 and table.concat(names, "
+") or "|cff999999None yet.|r")
         content:SetSize(listText:GetWidth(), listText:GetStringHeight() + 4)
     end
+
     panel:SetScript("OnShow", panel.Refresh)
 
     if Settings and Settings.RegisterCanvasLayoutCategory then
@@ -781,12 +845,24 @@ SlashCmdList.OLYMPUSMUTE = function(input)
         RemovePlayer(rest)
     elseif cmd == "clear" then
         ClearAll()
+    elseif cmd == "guild" then
+        local sub, arg = rest:match("^(%S*)%s*(.-)$")
+        sub = (sub or ""):lower()
+        if sub == "add" and arg ~= "" then
+            AddKeyword(arg)
+        elseif sub == "remove" and arg ~= "" then
+            RemoveKeyword(arg)
+        elseif sub == "list" or sub == "" then
+            ListKeywords()
+        else
+            Print("usage: /omute guild add|remove|list Name")
+        end
     elseif cmd == "addguild" and rest ~= "" then
-        AddGuildMatch(rest)
+        AddKeyword(rest) -- compatibility alias
     elseif cmd == "removeguild" and rest ~= "" then
-        RemoveGuildMatch(rest)
+        RemoveKeyword(rest) -- compatibility alias
     elseif cmd == "guilds" or cmd == "guildlist" then
-        ListGuildMatches()
+        ListKeywords() -- compatibility alias
     elseif cmd == "invites" and (rest == "on" or rest == "off") then
         SetDeclineGuild(rest == "on"); SetDeclineGroup(rest == "on")
     elseif cmd == "guildinvites" and (rest == "on" or rest == "off") then
@@ -800,6 +876,6 @@ SlashCmdList.OLYMPUSMUTE = function(input)
     else
         Print(("filtering %s, %d players muted."):format(
             db.enabled and "|cff00ff00ON|r" or "|cffff0000OFF|r", CountMuted()))
-        Print("/omute (opens options) | on | off | guildinvites on|off | groupinvites on|off | guilds | addguild text | removeguild text | list | scan | check Name | add Name | remove Name | clear")
+        Print("/omute (opens options) | on | off | guildinvites on|off | groupinvites on|off | guild add|remove|list Name | list | scan | check Name | add Name | remove Name | clear")
     end
 end
