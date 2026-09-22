@@ -144,6 +144,17 @@ It does not add players to your WoW ignore list, notify other players, or modify
 
 ## 📜 Version
 
+**1.2.0**
+
+### What's New in 1.2.0
+
+- Added smarter /who scanning with level-range tracking
+- Added automatic cleanup for players who leave matching guilds
+- Migrated existing guild filters to the new keyword system
+- Kept learned player data temporary and cleared on login
+- Preserved user-initiated /who scanning to avoid protected-action errors
+- Added support for both new and legacy guild filter commands
+
 **1.1.1**
 
 ### What's New in 1.1.1
