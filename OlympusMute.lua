@@ -801,8 +801,7 @@ CreatePanel = function()
         table.sort(names)
         countText:SetText(("Muted players: %d"):format(#names))
         listText:SetWidth(math.max(scroll:GetWidth() - 10, 200))
-        listText:SetText(#names > 0 and table.concat(names, "
-") or "|cff999999None yet.|r")
+        listText:SetText(#names > 0 and table.concat(names, "\n") or "|cff999999None yet.|r")
         content:SetSize(listText:GetWidth(), listText:GetStringHeight() + 4)
     end
 
