@@ -1,0 +1,8 @@
+## Interface: 11507
+## Title: OlympusMute
+## Notes: Hides chat messages from anyone whose guild name contains "Olympus". Client-side only; does not use the ignore list.
+## Author: Sol
+## Version: 1.0.5
+## SavedVariables: OlympusMuteDB
+
+OlympusMute.lua
