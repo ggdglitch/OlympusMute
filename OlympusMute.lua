@@ -3,7 +3,7 @@
 --
 -- Chat events don't carry the sender's guild, so the addon learns guilds by
 -- watching players it can see (target, mouseover, nameplates, group) and from
--- any /who results you run. Learned players are saved between sessions.
+-- any /who results you run. Learned players are kept only for the current session.
 
 -- Guild-name fragments to match (case-insensitive).
 -- Matches names such as "Olympus", "Olympus Canada", "Olympus-Canada", etc.
@@ -17,8 +17,6 @@ local pendingInvite                 -- normalized name of an unidentified group 
 local OnChatLine                    -- set below; runs on every line added to chat
 local scanStep = 0
 local scanQueries
-local backgroundScanTicker
-local BACKGROUND_SCAN_INTERVAL = 15
 local WhoScan
 
 local CHAT_EVENTS = {
@@ -370,18 +368,9 @@ f:SetScript("OnEvent", function(self, event, arg1, ...)
         InstallWhoDebounce()
         CreatePanel()
 
-        -- Slowly rotate through all configured guild /who queries in the
-        -- background. One query every 15 seconds keeps us comfortably away
-        -- from the game's /who throttle while still refreshing the list.
-        if C_Timer and C_Timer.After and C_Timer.NewTicker then
-            C_Timer.After(5, function()
-                if backgroundScanTicker then backgroundScanTicker:Cancel() end
-                backgroundScanTicker = C_Timer.NewTicker(BACKGROUND_SCAN_INTERVAL, function()
-                    pcall(WhoScan, true)
-                end)
-                pcall(WhoScan, true)
-            end)
-        end
+        -- C_FriendList.SendWho() requires a hardware event. Automatic
+        -- timer-based /who scans are blocked by WoW, so scans are initiated
+        -- only by the in-game Scan button or /omute scan command.
     elseif event == "PLAYER_TARGET_CHANGED" then
         SafeScan("target")
     elseif event == "UPDATE_MOUSEOVER_UNIT" then
@@ -470,8 +459,9 @@ local function ClearAll()
 end
 
 -- /who only returns the first 50 matches, so one search can't cover every
--- Olympus guild. Each click runs the next search in a rotation of level
--- ranges, reaching members the plain search cuts off.
+-- matching guild. Each user-initiated scan runs the next search in a rotation
+-- of level ranges, reaching members the plain search cuts off. WoW requires
+-- SendWho() to originate from a hardware event, so this cannot run on a timer.
 local function BuildScanQueries()
     local maxLevel = (GetMaxPlayerLevel and GetMaxPlayerLevel()) or 60
     local q = {}
@@ -501,7 +491,7 @@ WhoScan = function(silent)
     if not silent then
         Print(("scan %d/%d: /who %s"):format(scanStep, #scanQueries, query))
     elseif db and db.debug then
-        Print(("background scan %d/%d: /who %s"):format(scanStep, #scanQueries, query))
+        Print(("scan %d/%d: /who %s"):format(scanStep, #scanQueries, query))
     end
     if panel and panel.UpdateScanButton then panel:UpdateScanButton() end
 end
@@ -634,10 +624,10 @@ CreatePanel = function()
         return b
     end
 
-    local whoBtn = MakeButton("Scan /who Olympus guilds", 200, WhoScan, declineGroup, nil, -10)
+    local whoBtn = MakeButton("Scan /who guilds", 200, WhoScan, declineGroup, nil, -10)
     function panel:UpdateScanButton()
         local total = (scanQueries and #scanQueries) or #BuildScanQueries()
-        whoBtn:SetText(("Scan /who Olympus guilds (%d/%d)"):format(scanStep % total + 1, total))
+        whoBtn:SetText(("Scan /who guilds (%d/%d)"):format(scanStep % total + 1, total))
     end
     local clearBtn = MakeButton("Clear player list", 130, function() StaticPopup_Show("OLYMPUSMUTE_CLEAR") end, whoBtn, 8, 0)
 
